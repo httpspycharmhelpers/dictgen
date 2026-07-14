@@ -1,11 +1,11 @@
-```
+
 # dictgen – Dictionary Generator
 
 A highly customizable command-line tool for generating passwords, wordlists, binary sequences, etc.
 
 ## Build
 
-```bash
+```
 gcc -o dictgen dictgen.c -O2 -Wall
 ```
 
@@ -37,9 +37,9 @@ Option Description
 -d FILE Dictionary file (required for word mode)
 --format FORMAT Output format: none (default), space, escape
 
-Examples
+## Examples
 
-```bash
+```
 # Generate 3-digit combinations from abc
 ./dictgen -l 3 -c "abc"
 
@@ -48,6 +48,4 @@ Examples
 
 # 4-bit binary with spaces
 ./dictgen --binary -l 4 --format space
-```
-
 ```
