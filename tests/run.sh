@@ -74,6 +74,16 @@ expect "pi 20 decimals" \
 expect "pi 10 decimals" \
   "3.1415926536" "$($BIN pi 10)"
 
+echo "== precision aliases =="
+expect "--digits N (calc)" \
+  "62.8318530717958647692528676656" "$($BIN calc "2*pi*10" --digits 30)"
+expect "--digits=N (calc)" \
+  "62.8318530717958647692528676656" "$($BIN calc "2*pi*10" --digits=30)"
+expect "--places N (calc)" \
+  "62.8318530717958647692528676656" "$($BIN calc "2*pi*10" --places 30)"
+expect "--digits still charset (gen)" \
+  "0 0 0 1 0 2 0 3" "$($BIN -l 2 --digits -n 4 --format space -t | tr '\n' ' ' | sed 's/ $//')"
+
 echo "== errors =="
 expect "division by zero"   "1" "$($BIN calc '1/0' >/dev/null 2>&1; echo $?)"
 expect "syntax error"       "1" "$($BIN calc '1+' >/dev/null 2>&1; echo $?)"

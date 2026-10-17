@@ -127,6 +127,29 @@ static int parse_calc_args(int argc, char **argv, int *expr_start)
     return rc;
 }
 
+/* In calc/pi mode "--digits N" means the output precision.  Rewrite it to
+ * "--precision" so the same token keeps working as the charset flag for
+ * generation.  Returns a malloc'd argv-style array (argv[0] preserved). */
+static char **map_calc_argv(int argc, char **argv)
+{
+    char **a = malloc(sizeof(char *) * (size_t)(argc + 1));
+    if (!a) return NULL;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--digits") == 0) {
+            a[i] = (char *)"--precision";
+        } else if (strncmp(argv[i], "--digits=", 9) == 0) {
+            size_t n = strlen(argv[i]) + 4;
+            char *s = malloc(n);
+            if (s) snprintf(s, n, "--precision=%s", argv[i] + 9);
+            a[i] = s ? s : argv[i];
+        } else {
+            a[i] = argv[i];
+        }
+    }
+    a[argc] = NULL;
+    return a;
+}
+
 static Config cfg = {
     .mode = "password",
     .min_len = 1,
@@ -212,6 +235,15 @@ static int map_binary_name(const char *pwd, int len, char *out, size_t outsz)
 /* Append one generated item to the staging buffer, followed by '\n'. */
 static void emit(char *buf, size_t *len, const char *pwd, int pwlen)
 {
+    /* fast path: plain output, no prefix/suffix/ascii mapping */
+    if (cfg.format == FORMAT_NONE && !cfg.prefix[0] && !cfg.suffix[0] &&
+        !cfg.ascii_names) {
+        memcpy(buf + *len, pwd, (size_t)pwlen);
+        *len += (size_t)pwlen;
+        buf[(*len)++] = '\n';
+        return;
+    }
+
     char mapped[64];
     char *body = (char *)pwd;
     int bodylen = pwlen;
@@ -560,32 +592,36 @@ int main(int argc, char *argv[])
 
     if (argc >= 2 && strcmp(argv[1], "calc") == 0) {
         /* calc [options] expr [options] */
-        int es = find_expr_start(argc, argv);
-        if (es < argc && argv[es][0] == '-' && argv[es][1] != '\0') {
+        char **ca = map_calc_argv(argc, argv);
+        if (!ca) { fprintf(stderr, "内存不足\n"); return 1; }
+        int es = find_expr_start(argc, ca);
+        if (es < argc && ca[es][0] == '-' && ca[es][1] != '\0') {
             /* expression itself starts with '-', e.g. "-5": options may only
              * appear before it (getopt would misparse "-5" as options). */
-            if (parse_calc_args(argc, argv, &es)) return 1;
+            if (parse_calc_args(argc, ca, &es)) return 1;
             for (int j = es; j < argc; j++) {
                 if (cfg.expr[0]) safe_strcat(cfg.expr, sizeof(cfg.expr), " ");
-                safe_strcat(cfg.expr, sizeof(cfg.expr), argv[j]);
+                safe_strcat(cfg.expr, sizeof(cfg.expr), ca[j]);
             }
         } else {
-            if (parse_args(argc - 1, argv + 1)) return 1;
+            if (parse_args(argc - 1, ca + 1)) return 1;
         }
         if (cfg.expr[0] == '\0') { fprintf(stderr, "用法: %s calc [选项] \"表达式\"\n", argv[0]); return 1; }
         return run_calc();
     }
     if (argc >= 2 && strcmp(argv[1], "pi") == 0) {
         /* pi [N] [options]  - print pi to N decimal places (default 50) */
-        int es = find_expr_start(argc, argv);
-        if (es < argc && argv[es][0] == '-' && argv[es][1] != '\0') {
-            if (parse_calc_args(argc, argv, &es)) return 1;
+        char **ca = map_calc_argv(argc, argv);
+        if (!ca) { fprintf(stderr, "内存不足\n"); return 1; }
+        int es = find_expr_start(argc, ca);
+        if (es < argc && ca[es][0] == '-' && ca[es][1] != '\0') {
+            if (parse_calc_args(argc, ca, &es)) return 1;
             for (int j = es; j < argc; j++) {
                 if (cfg.expr[0]) safe_strcat(cfg.expr, sizeof(cfg.expr), " ");
-                safe_strcat(cfg.expr, sizeof(cfg.expr), argv[j]);
+                safe_strcat(cfg.expr, sizeof(cfg.expr), ca[j]);
             }
         } else {
-            if (parse_args(argc - 1, argv + 1)) return 1;
+            if (parse_args(argc - 1, ca + 1)) return 1;
         }
         long n = 50;
         int explicit_digits = (cfg.calc_digits != 50);
