@@ -1,3 +1,17 @@
+/*
+ * dictgen - dictionary / password generator + arbitrary-precision calculator
+ *
+ *   dictgen [GENERATION OPTIONS]            generate a wordlist (fast)
+ *   dictgen calc [OPTIONS] "EXPRESSION"     evaluate a big-number expression
+ *   dictgen pi [N]                          pi to N decimal digits
+ *
+ * Generation is streaming and single-pass; the odometer uses an index array
+ * (no strchr per character) and output is buffered in large blocks, so
+ * hundreds of millions of entries are produced at memory/IO bandwidth.
+ *
+ * Calculations use GMP (exact big integers) and MPFR (arbitrary-precision
+ * reals) - e.g. 2^1000000, 100000!, pi to a million digits, k*pi, pi^k.
+ */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,17 +20,21 @@
 #include <time.h>
 #include <limits.h>
 #include <errno.h>
+#include <ctype.h>
 
-#define VERSION "1.2.0"
+#include "out.h"
+#include "calc.h"
+#include <gmp.h>
+#include <mpfr.h>
+
+#define VERSION "2.0.0"
 #define DEFAULT_OUTPUT "passwords.txt"
-#define BATCH_SIZE 1000
-#define MAX_LINE 1024
+#define MAX_LINE 4096
+#define OUT_BLOCK (1u << 20)   /* 1 MiB line-staging buffer */
 
-typedef enum {
-    FORMAT_NONE,
-    FORMAT_SPACE,
-    FORMAT_ESCAPE
-} FormatType;
+static const char *g_prog = "dictgen";
+
+typedef enum { FORMAT_NONE, FORMAT_SPACE, FORMAT_ESCAPE } FormatType;
 
 typedef struct {
     char mode[16];
@@ -26,17 +44,88 @@ typedef struct {
     char charset[256];
     char prefix[64];
     char suffix[64];
-    char output_file[256];
+    char output_file[512];
     unsigned long long limit;
     int random_mode;
     unsigned long long random_count;
-    char dict_file[256];
+    char dict_file[512];
     char separator[8];
     int verbose;
     FormatType format;
     int ascii_names;
-    char map_file[256];
+    char map_file[512];
+    int to_stdout;
+    int output_set;
+    long calc_digits;
+    char expr[8192];
 } Config;
+
+static int parse_args(int argc, char *argv[]);
+
+/* Number of following arguments consumed by an option-looking token, or -1 if
+ * the token is not a known option (in which case it is the start of the
+ * expression, e.g. "-5" or "-5+1"). */
+static int opt_arity(const char *a)
+{
+    if (a[0] != '-' || a[1] == '\0') return -1;
+    if (a[1] == '-') {                                   /* long option */
+        if (strchr(a, '=')) return 0;                    /* --opt=val */
+        static const char *with_val[] = {
+            "--output","--min","--max","--length","--charset","--prefix","--suffix",
+            "--limit","--count","--mode","--dict","--separator","--precision","--places",
+            "--format","--map-file", NULL };
+        for (int i = 0; with_val[i]; i++) if (strcmp(a, with_val[i]) == 0) return 1;
+        static const char *flags[] = {
+            "--help","--verbose","--version","--stdout","--random","--lowercase",
+            "--uppercase","--digits","--numbers","--symbols","--binary","--hex","--octal",
+            "--ascii-names", NULL };
+        for (int i = 0; flags[i]; i++) if (strcmp(a, flags[i]) == 0) return 0;
+        return -1;
+    }
+    if (strcmp(a, "-tff") == 0) return 0;
+    switch (a[1]) {                                      /* short options */
+        case 'o': case 'm': case 'M': case 'l': case 'c': case 'p': case 's':
+        case 'n': case 'R': case 'a': case 'd': case 'S': case 'D': case 'F': case 'f':
+            return a[2] == '\0' ? 1 : 0;                 /* -oFILE attached => 0 */
+        case 'h': case 'v': case 't': case 'r':
+            return 0;
+        default:
+            return -1;
+    }
+}
+
+/* Index of the first argument (>= 2) that begins the expression, i.e. after
+ * all recognised options and their values. */
+static int find_expr_start(int argc, char **argv)
+{
+    int i = 2;
+    while (i < argc) {
+        const char *a = argv[i];
+        if (strcmp(a, "--") == 0) { i++; break; }
+        if (a[0] != '-' || a[1] == '\0') break;
+        int ar = opt_arity(a);
+        if (ar < 0) break;
+        i += 1 + ar;
+    }
+    return i;
+}
+
+/* Parse the options of a subcommand while leaving the expression untouched.
+ * Returns 0 on success and stores the expression-start index in *expr_start. */
+static int parse_calc_args(int argc, char **argv, int *expr_start)
+{
+    int es = find_expr_start(argc, argv);
+    int on = 1 + (es - 2);                 /* argv[0] + options */
+    char **oa = malloc(sizeof(char *) * (size_t)(on + 1));
+    if (!oa) { fprintf(stderr, "内存不足\n"); return 1; }
+    oa[0] = argv[0];
+    for (int j = 2; j < es; j++) oa[j - 1] = argv[j];
+    oa[on] = NULL;
+    int rc = parse_args(on, oa);
+    free(oa);
+    *expr_start = es;
+    return rc;
+}
 
 static Config cfg = {
     .mode = "password",
@@ -55,7 +144,11 @@ static Config cfg = {
     .verbose = 0,
     .format = FORMAT_NONE,
     .ascii_names = 0,
-    .map_file = ""
+    .map_file = "",
+    .to_stdout = 0,
+    .output_set = 0,
+    .calc_digits = 50,
+    .expr = "",
 };
 
 #define LOWERCASE "abcdefghijklmnopqrstuvwxyz"
@@ -63,222 +156,278 @@ static Config cfg = {
 #define DIGITS "0123456789"
 #define SYMBOLS "!@#$%^&*()_+-=[]{};:'\"\\|,./<>?"
 
-const char* get_ascii_name(unsigned int val) {
+static const char *ascii_name(unsigned int val)
+{
     static const char *names[256] = {
-        "NUL", "SOH", "STX", "ETX", "EOT", "ENQ", "ACK", "BEL",
-        "BS",  "TAB", "LF",  "VT",  "FF",  "CR",  "SO",  "SI",
-        "DLE", "DC1", "DC2", "DC3", "DC4", "NAK", "SYN", "ETB",
-        "CAN", "EM",  "SUB", "ESC", "FS",  "GS",  "RS",  "US",
-        "SP",  "!",   "\"",  "#",   "$",   "%",   "&",   "'",
-        "(",   ")",   "*",   "+",   ",",   "-",   ".",   "/",
-        "0",   "1",   "2",   "3",   "4",   "5",   "6",   "7",
-        "8",   "9",   ":",   ";",   "<",   "=",   ">",   "?",
-        "@",   "A",   "B",   "C",   "D",   "E",   "F",   "G",
-        "H",   "I",   "J",   "K",   "L",   "M",   "N",   "O",
-        "P",   "Q",   "R",   "S",   "T",   "U",   "V",   "W",
-        "X",   "Y",   "Z",   "[",   "\\",  "]",   "^",   "_",
-        "`",   "a",   "b",   "c",   "d",   "e",   "f",   "g",
-        "h",   "i",   "j",   "k",   "l",   "m",   "n",   "o",
-        "p",   "q",   "r",   "s",   "t",   "u",   "v",   "w",
-        "x",   "y",   "z",   "{",   "|",   "}",   "~",   "DEL"
+        "NUL","SOH","STX","ETX","EOT","ENQ","ACK","BEL",
+        "BS","TAB","LF","VT","FF","CR","SO","SI",
+        "DLE","DC1","DC2","DC3","DC4","NAK","SYN","ETB",
+        "CAN","EM","SUB","ESC","FS","GS","RS","US",
+        "SP","!","\"","#","$","%","&","'",
+        "(",")","*","+",",","-",".","/",
+        "0","1","2","3","4","5","6","7",
+        "8","9",":",";","<","=",">","?",
+        "@","A","B","C","D","E","F","G",
+        "H","I","J","K","L","M","N","O",
+        "P","Q","R","S","T","U","V","W",
+        "X","Y","Z","[","\\","]","^","_",
+        "`","a","b","c","d","e","f","g",
+        "h","i","j","k","l","m","n","o",
+        "p","q","r","s","t","u","v","w",
+        "x","y","z","{","|","}","~","DEL"
     };
-    if (val < 256) return names[val];
-    return "???";
+    return val < 256 ? names[val] : "???";
 }
 
-void print_help(const char *prog);
-void print_version(void);
-int parse_args(int argc, char *argv[]);
-void validate_config(void);
-unsigned long long estimate_total(int len, int charset_len);
-void generate_passwords(void);
-void generate_words(void);
-void generate_random(void);
-int next_password(char *pwd, int len, const char *charset);
-void safe_strcat(char *dest, size_t size, const char *src);
-void format_password(const char *pwd, char *out, size_t out_size, FormatType format);
-void apply_mapping(const char *pwd, char *out, size_t out_size);
+static void print_help(const char *prog);
+static void print_version(void);
+static int  parse_args(int argc, char *argv[]);
+static void validate_config(void);
 
-int main(int argc, char *argv[]) {
-    srand((unsigned)time(NULL));
+/* ----------------------------------------------------------------------- */
+/* generation                                                              */
+/* ----------------------------------------------------------------------- */
 
-    if (argc == 1) {
-        print_help(argv[0]);
-        return 0;
+static void safe_strcat(char *dest, size_t size, const char *src)
+{
+    size_t dl = strlen(dest);
+    if (dl >= size - 1) return;
+    strncat(dest, src, size - dl - 1);
+}
+
+/* Apply ascii-name mapping (binary -> control-char name).  Returns 1 if the
+ * value was remapped, else 0 (caller keeps the raw text). */
+static int map_binary_name(const char *pwd, int len, char *out, size_t outsz)
+{
+    if (!cfg.ascii_names || len > 8) return 0;
+    unsigned int val = 0;
+    for (int i = 0; i < len; i++) {
+        if (pwd[i] != '0' && pwd[i] != '1') return 0;
+        val = (val << 1) | (unsigned)(pwd[i] - '0');
+    }
+    snprintf(out, outsz, "%s", ascii_name(val));
+    return 1;
+}
+
+/* Append one generated item to the staging buffer, followed by '\n'. */
+static void emit(char *buf, size_t *len, const char *pwd, int pwlen)
+{
+    char mapped[64];
+    char *body = (char *)pwd;
+    int bodylen = pwlen;
+
+    if (cfg.ascii_names && map_binary_name(pwd, pwlen, mapped, sizeof(mapped))) {
+        body = mapped;
+        bodylen = (int)strlen(mapped);
     }
 
-    if (parse_args(argc, argv) != 0) {
+    const char *pre = cfg.prefix, *suf = cfg.suffix;
+    memcpy(buf + *len, pre, strlen(pre)); *len += strlen(pre);
+
+    switch (cfg.format) {
+        case FORMAT_SPACE:
+            for (int i = 0; i < bodylen; i++) {
+                if (i) buf[(*len)++] = ' ';
+                buf[(*len)++] = body[i];
+            }
+            break;
+        case FORMAT_ESCAPE:
+            for (int i = 0; i < bodylen; i++) {
+                static const char hex[] = "0123456789ABCDEF";
+                unsigned char cv = (unsigned char)body[i];
+                buf[(*len)++] = '\\'; buf[(*len)++] = 'x';
+                buf[(*len)++] = hex[cv >> 4]; buf[(*len)++] = hex[cv & 15];
+            }
+            break;
+        default:
+            memcpy(buf + *len, body, bodylen); *len += bodylen;
+            break;
+    }
+
+    memcpy(buf + *len, suf, strlen(suf)); *len += strlen(suf);
+    buf[(*len)++] = '\n';
+}
+
+static void generate_passwords(void)
+{
+    Out *o = out_open(cfg.output_file, cfg.to_stdout);
+    if (!o) { fprintf(stderr, "无法打开输出: %s: %s\n", cfg.output_file, strerror(errno)); exit(1); }
+
+    int cslen = (int)strlen(cfg.charset);
+    unsigned long long total = 0;
+    /* one item can expand to 4 bytes/char (escape) plus prefix/suffix/newline */
+    size_t itemmax = (size_t)cfg.max_len * 4 + strlen(cfg.prefix) + strlen(cfg.suffix) + 16;
+    size_t bufsz = OUT_BLOCK + itemmax;
+    char *buf = malloc(bufsz);
+    char *pwd = NULL;
+    int *idx = NULL;
+    if (!buf) { perror("malloc"); exit(1); }
+
+    for (int len = cfg.min_len; len <= cfg.max_len && !out_error(o); len++) {
+        free(pwd); free(idx);
+        pwd = malloc((size_t)len + 1);
+        idx = malloc((size_t)len * sizeof(int));
+        if (!pwd || !idx) { perror("malloc"); exit(1); }
+        for (int i = 0; i < len; i++) { idx[i] = 0; pwd[i] = cfg.charset[0]; }
+        pwd[len] = '\0';
+
+        if (cfg.verbose) printf("长度 %d: 开始生成\n", len);
+
+        size_t blen = 0;
+        int done = 0;
+        while (!done) {
+            if (cfg.limit && total >= cfg.limit) break;
+            emit(buf, &blen, pwd, len);
+            total++;
+            if (blen >= OUT_BLOCK) {
+                out_write(o, buf, blen);
+                blen = 0;
+            }
+            /* odometer increment (rightmost position) */
+            int i = len - 1;
+            while (i >= 0 && idx[i] == cslen - 1) { idx[i] = 0; pwd[i] = cfg.charset[0]; i--; }
+            if (i < 0) done = 1;
+            else { idx[i]++; pwd[i] = cfg.charset[idx[i]]; }
+        }
+        if (blen) { out_write(o, buf, blen); blen = 0; }
+        if (cfg.limit && total >= cfg.limit) break;
+    }
+
+    free(buf); free(pwd); free(idx);
+    if (cfg.verbose) printf("共生成 %llu 项\n", total);
+    out_close(o);
+}
+
+static void generate_random(void)
+{
+    Out *o = out_open(cfg.output_file, cfg.to_stdout);
+    if (!o) { fprintf(stderr, "无法打开输出: %s: %s\n", cfg.output_file, strerror(errno)); exit(1); }
+
+    int len = cfg.fixed_len ? cfg.fixed_len : (cfg.min_len + cfg.max_len) / 2;
+    if (len < 1) len = 1;
+    int cslen = (int)strlen(cfg.charset);
+    char *pwd = malloc((size_t)len + 1);
+    size_t itemmax = (size_t)len * 4 + strlen(cfg.prefix) + strlen(cfg.suffix) + 16;
+    char *buf = malloc(OUT_BLOCK + itemmax);
+    if (!pwd || !buf) { perror("malloc"); exit(1); }
+    pwd[len] = '\0';
+
+    /* random bytes via getrandom-equivalent (rand() fallback) */
+    unsigned long long generated = 0;
+    size_t blen = 0;
+    while (generated < cfg.random_count && !out_error(o)) {
+        for (int i = 0; i < len; i++) pwd[i] = cfg.charset[rand() % cslen];
+        emit(buf, &blen, pwd, len);
+        generated++;
+        if (blen >= OUT_BLOCK) { out_write(o, buf, blen); blen = 0; }
+    }
+    if (blen) out_write(o, buf, blen);
+    free(pwd); free(buf);
+    out_close(o);
+}
+
+static void generate_words(void)
+{
+    FILE *fp_dict = fopen(cfg.dict_file, "r");
+    if (!fp_dict) { fprintf(stderr, "无法打开词典: %s: %s\n", cfg.dict_file, strerror(errno)); exit(1); }
+    Out *o = out_open(cfg.output_file, cfg.to_stdout);
+    if (!o) { fclose(fp_dict); fprintf(stderr, "无法打开输出: %s: %s\n", cfg.output_file, strerror(errno)); exit(1); }
+
+    char line[MAX_LINE];
+    unsigned long long count = 0;
+    while (fgets(line, sizeof(line), fp_dict)) {
+        if (cfg.limit && count >= cfg.limit) break;
+        line[strcspn(line, "\n")] = '\0';
+        out_printf(o, "%s%s%s\n", cfg.prefix, line, cfg.suffix);
+        count++;
+    }
+    fclose(fp_dict);
+    out_close(o);
+}
+
+/* ----------------------------------------------------------------------- */
+/* calc mode                                                               */
+/* ----------------------------------------------------------------------- */
+
+static int run_calc(void)
+{
+    const char *err = NULL;
+    char *res = calc_run(cfg.expr, cfg.calc_digits, &err);
+    if (!res) {
+        fprintf(stderr, "计算出错: %s\n", err ? err : "未知错误");
         return 1;
     }
-    validate_config();
-
-    if (cfg.verbose) {
-        printf("Mode: %s\n", cfg.mode);
-        if (strcmp(cfg.mode, "password") == 0) {
-            if (cfg.fixed_len)
-                printf("Length: %d\n", cfg.fixed_len);
-            else
-                printf("Length range: %d ~ %d\n", cfg.min_len, cfg.max_len);
-            printf("Charset: %s\n", cfg.charset[0] ? cfg.charset : "(using built-in combination)");
-        }
-        if (cfg.prefix[0]) printf("Prefix: %s\n", cfg.prefix);
-        if (cfg.suffix[0]) printf("Suffix: %s\n", cfg.suffix);
-        printf("Output file: %s\n", cfg.output_file);
-        if (cfg.limit) printf("Generation limit: %llu\n", cfg.limit);
-        if (cfg.random_mode) printf("Random generation: %llu items\n", cfg.random_count);
-        printf("Format: ");
-        switch (cfg.format) {
-            case FORMAT_SPACE:  printf("space separated\n"); break;
-            case FORMAT_ESCAPE: printf("\\x escaped\n"); break;
-            default:            printf("plain\n");
-        }
-        if (cfg.ascii_names) printf("ASCII name mapping: enabled\n");
-        printf("----------------------------------------\n");
-    }
-
-    if (strcmp(cfg.mode, "word") == 0) {
-        generate_words();
-    } else if (cfg.random_mode) {
-        generate_random();
-    } else {
-        generate_passwords();
-    }
-
-    printf("Done! Results saved to %s\n", cfg.output_file);
+    /* A calculator should print to the terminal by default; only write to a
+     * file when -o was given or --stdout is explicit. */
+    int to_stdout = cfg.to_stdout || !cfg.output_set;
+    Out *o = out_open(cfg.output_file, to_stdout);
+    if (!o) { fprintf(stderr, "无法打开输出: %s: %s\n", cfg.output_file, strerror(errno)); free(res); return 1; }
+    out_puts(o, res);
+    out_puts(o, "\n");
+    out_close(o);
+    free(res);
     return 0;
 }
 
-void print_help(const char *prog) {
-    printf("Usage: %s [options]\n\n", prog);
-    printf("Basic options:\n");
-    printf("  -h, --help              Show this help\n");
-    printf("  --version               Show version information\n");
-    printf("  -v, --verbose           Show progress information\n");
-    printf("  -o, --output FILE       Output file (default: %s)\n", DEFAULT_OUTPUT);
-    printf("  -m, --min N             Minimum length (default: 1)\n");
-    printf("  -M, --max N             Maximum length (default: 8)\n");
-    printf("  -l, --length N          Fixed length (overrides min/max)\n");
-    printf("  -c, --charset STR       Custom character set\n");
-    printf("  --lowercase             Include lowercase letters\n");
-    printf("  --uppercase             Include uppercase letters\n");
-    printf("  --digits                Include digits\n");
-    printf("  --symbols               Include symbols\n");
-    printf("  --binary                Use binary charset (01)\n");
-    printf("  --hex                   Use hexadecimal charset (0-9A-F)\n");
-    printf("  --octal                 Use octal charset (0-7)\n");
-    printf("  --ascii-names           Map binary values to ASCII control character names\n");
-    printf("                          (only effective when charset is 01 and length <= 8)\n");
-    printf("  -p, --prefix STR        Add prefix\n");
-    printf("  -s, --suffix STR        Add suffix\n");
-    printf("  -n, --limit N           Maximum number of generated items (default: unlimited)\n");
-    printf("  -r, --random            Enable random generation mode\n");
-    printf("  -R, --count N           Number of random items to generate (requires -r)\n");
-    printf("  -a, --mode MODE         Mode: password or word (default: password)\n");
-    printf("  -d, --dict FILE         Dictionary file (required for word mode)\n");
-    printf("  -S, --separator CHAR    Separator for combining words (not implemented yet)\n");
-    printf("  --format FORMAT         Output format: none, space, escape (default: none)\n");
-    printf("    none   : plain output\n");
-    printf("    space  : insert spaces between characters (e.g. \"1 0 1\")\n");
-    printf("    escape : escape as \\x form (e.g. \"\\x01\", per character)\n\n");
-    printf("Examples:\n");
-    printf("  %s -l 6 -c \"abc123\" -o pass.txt\n", prog);
-    printf("  %s --min 4 --max 6 --prefix \"admin_\" --suffix \"2026\" --lowercase --digits\n", prog);
-    printf("  %s -r -R 100 -l 8 -c \"0123456789\"\n", prog);
-    printf("  %s --mode word --dict words.txt --suffix \"!\"\n", prog);
-    printf("  %s --binary -l 4 --format space -n 10        generate 4-bit binary with spaces\n", prog);
-    printf("  %s --binary -l 3 --ascii-names -n 8          generate 3-bit binary mapped to NUL, SOH...\n", prog);
+/* ----------------------------------------------------------------------- */
+/* CLI                                                                     */
+/* ----------------------------------------------------------------------- */
+
+static void print_version(void)
+{
+    printf("dictgen v%s (GMP %s / MPFR %s)\n", VERSION,
+           gmp_version, mpfr_get_version());
+    printf("Compiled %s %s\n", __DATE__, __TIME__);
 }
 
-void print_version(void) {
-    printf("Dictionary Generator v%s\n", VERSION);
-    printf("Compiled on %s %s\n", __DATE__, __TIME__);
+static void print_help(const char *prog)
+{
+    printf("dictgen v%s - 字典生成器 + 任意精度计算器\n\n", VERSION);
+    printf("用法:\n");
+    printf("  %s [生成选项]                    生成字典（默认写入 %s）\n", prog, DEFAULT_OUTPUT);
+    printf("  %s calc [选项] \"表达式\"          计算大数表达式\n", prog);
+    printf("  %s pi [N]                       输出 π 的 N 位小数（默认 50）\n\n", prog);
+
+    printf("生成选项:\n");
+    printf("  -l, --length N         固定长度        -m/--min N  最小长度(默认1)\n");
+    printf("  -M, --max N            最大长度(默认8)\n");
+    printf("  -c, --charset STR      自定义字符集\n");
+    printf("      --lowercase --uppercase --digits --symbols\n");
+    printf("      --binary(01) --hex(0-9A-F) --octal(0-7)\n");
+    printf("  -p, --prefix STR       前缀            -s, --suffix STR  后缀\n");
+    printf("  -n, --limit N          最多生成 N 项（默认不限）\n");
+    printf("  -r, --random           随机模式        -R, --count N  随机项数\n");
+    printf("  -a, --mode MODE        password | word | calc\n");
+    printf("  -d, --dict FILE        word 模式词典文件\n");
+    printf("      --format FORMAT    none | space | escape\n");
+    printf("      --ascii-names      二进制映射为 ASCII 名称\n\n");
+
+    printf("计算选项:\n");
+    printf("  -D, --precision N      精度（有效数字，默认 50；别名 --places）\n");
+    printf("  支持: + - * / %% ^ ! ( )  pi e sqrt() abs() fact() pow() digit(x,k)\n");
+    printf("  示例: \"2^1000000\"  \"100000!\"  \"2*pi*10\"  \"digit(2*pi,32)\"  \"pi^2\"\n\n");
+
+    printf("输出选项:\n");
+    printf("  -o, --output FILE      输出文件；以 .tar/.tar.gz/.tgz 结尾则打包\n");
+    printf("  -t, --stdout           直接输出到终端（-tff 同义），不写文件\n");
+    printf("  -v, --verbose          显示进度        --version  版本\n");
+    printf("  -h, --help             帮助\n\n");
+
+    printf("示例:\n");
+    printf("  %s -l 8 -c \"0123456789\" -n 100000000 -o num.tar.gz\n", prog);
+    printf("  %s calc \"2^1000000\" -o power.txt\n", prog);
+    printf("  %s calc -D 1000000 \"2*pi*10\" -o two_pi.tar.gz\n", prog);
+    printf("  %s calc \"digit(2*pi,32)\" -t\n", prog);
+    printf("  %s pi 1000000 -t\n", prog);
 }
 
-void safe_strcat(char *dest, size_t size, const char *src) {
-    strncat(dest, src, size - strlen(dest) - 1);
-}
-
-void apply_mapping(const char *pwd, char *out, size_t out_size) {
-    if (!cfg.ascii_names && cfg.map_file[0] == '\0') {
-        strncpy(out, pwd, out_size - 1);
-        out[out_size - 1] = '\0';
-        return;
-    }
-
-    if (cfg.ascii_names) {
-        int len = strlen(pwd);
-        int is_binary = 1;
-        for (int i = 0; i < len; i++) {
-            if (pwd[i] != '0' && pwd[i] != '1') {
-                is_binary = 0;
-                break;
-            }
-        }
-        if (is_binary && len <= 8) {
-            unsigned int val = 0;
-            for (int i = 0; i < len; i++) {
-                val = (val << 1) | (pwd[i] - '0');
-            }
-            const char *name = get_ascii_name(val);
-            snprintf(out, out_size, "%s", name);
-            return;
-        } else {
-            strncpy(out, pwd, out_size - 1);
-            out[out_size - 1] = '\0';
-            return;
-        }
-    }
-
-    strncpy(out, pwd, out_size - 1);
-    out[out_size - 1] = '\0';
-}
-
-void format_password(const char *pwd, char *out, size_t out_size, FormatType format) {
-    if (format == FORMAT_NONE) {
-        strncpy(out, pwd, out_size - 1);
-        out[out_size - 1] = '\0';
-        return;
-    }
-
-    int len = strlen(pwd);
-    char *ptr = out;
-    size_t remaining = out_size;
-
-    for (int i = 0; i < len; i++) {
-        switch (format) {
-            case FORMAT_SPACE:
-                if (i > 0) {
-                    int n = snprintf(ptr, remaining, " %c", pwd[i]);
-                    if (n < 0 || n >= (int)remaining) return;
-                    ptr += n;
-                    remaining -= n;
-                } else {
-                    int n = snprintf(ptr, remaining, "%c", pwd[i]);
-                    if (n < 0 || n >= (int)remaining) return;
-                    ptr += n;
-                    remaining -= n;
-                }
-                break;
-            case FORMAT_ESCAPE:
-                {
-                    int n = snprintf(ptr, remaining, "\\x%02X", (unsigned char)pwd[i]);
-                    if (n < 0 || n >= (int)remaining) return;
-                    ptr += n;
-                    remaining -= n;
-                }
-                break;
-            default:
-                break;
-        }
-    }
-    *ptr = '\0';
-}
-
-int parse_args(int argc, char *argv[]) {
+static int parse_args(int argc, char *argv[])
+{
     static struct option long_options[] = {
         {"help",        no_argument,       0, 'h'},
-        {"version",     no_argument,       0, 1000 },
+        {"version",     no_argument,       0, 1000},
         {"output",      required_argument, 0, 'o'},
+        {"stdout",      no_argument,       0, 't'},
         {"min",         required_argument, 0, 'm'},
         {"max",         required_argument, 0, 'M'},
         {"length",      required_argument, 0, 'l'},
@@ -295,10 +444,13 @@ int parse_args(int argc, char *argv[]) {
         {"lowercase",   no_argument,       0, '1'},
         {"uppercase",   no_argument,       0, '2'},
         {"digits",      no_argument,       0, '3'},
+        {"numbers",     no_argument,       0, '3'},
         {"symbols",     no_argument,       0, '4'},
         {"binary",      no_argument,       0, '5'},
         {"hex",         no_argument,       0, '6'},
         {"octal",       no_argument,       0, '7'},
+        {"precision",   required_argument, 0, 'D'},
+        {"places",      required_argument, 0, 'D'},
         {"format",      required_argument, 0, 'F'},
         {"ascii-names", no_argument,       0, 'A'},
         {"map-file",    required_argument, 0, 'f'},
@@ -307,236 +459,174 @@ int parse_args(int argc, char *argv[]) {
 
     int opt, opt_idx = 0;
     char builtin[256] = "";
+    opterr = 0;
 
-    while ((opt = getopt_long(argc, argv, "hvo:m:M:l:c:p:s:n:rR:a:d:S:v",
+    /* Support "-tff" as an alias for "--stdout" (getopt would otherwise split
+     * it into -t -f f, treating "f" as the --map-file argument). */
+    char **av = malloc(sizeof(char *) * (argc + 1));
+    if (!av) { fprintf(stderr, "内存不足\n"); return 1; }
+    for (int i = 0; i < argc; i++)
+        av[i] = (strcmp(argv[i], "-tff") == 0) ? (char *)"--stdout" : argv[i];
+    av[argc] = NULL;
+
+    while ((opt = getopt_long(argc, av, "hvo:m:M:l:c:p:s:n:rR:a:d:S:tD:",
                               long_options, &opt_idx)) != -1) {
         switch (opt) {
-            case 'h': print_help(argv[0]); exit(0);
-            case 1000: print_version(); exit(0);
-            case 'o': strncpy(cfg.output_file, optarg, sizeof(cfg.output_file)-1); break;
+            case 'h': print_help(g_prog); free(av); exit(0);
+            case 1000: print_version(); free(av); exit(0);
+            case 'o': snprintf(cfg.output_file, sizeof(cfg.output_file), "%s", optarg); cfg.output_set = 1; break;
+            case 't': cfg.to_stdout = 1; break;
             case 'm': cfg.min_len = atoi(optarg); break;
             case 'M': cfg.max_len = atoi(optarg); break;
             case 'l': cfg.fixed_len = atoi(optarg); cfg.min_len = cfg.max_len = cfg.fixed_len; break;
-            case 'c': strncpy(cfg.charset, optarg, sizeof(cfg.charset)-1); break;
-            case 'p': strncpy(cfg.prefix, optarg, sizeof(cfg.prefix)-1); break;
-            case 's': strncpy(cfg.suffix, optarg, sizeof(cfg.suffix)-1); break;
+            case 'c': snprintf(cfg.charset, sizeof(cfg.charset), "%s", optarg); break;
+            case 'p': snprintf(cfg.prefix, sizeof(cfg.prefix), "%s", optarg); break;
+            case 's': snprintf(cfg.suffix, sizeof(cfg.suffix), "%s", optarg); break;
             case 'n': cfg.limit = strtoull(optarg, NULL, 10); break;
             case 'r': cfg.random_mode = 1; break;
             case 'R': cfg.random_count = strtoull(optarg, NULL, 10); break;
-            case 'a': strncpy(cfg.mode, optarg, sizeof(cfg.mode)-1); break;
-            case 'd': strncpy(cfg.dict_file, optarg, sizeof(cfg.dict_file)-1); break;
-            case 'S': strncpy(cfg.separator, optarg, sizeof(cfg.separator)-1); break;
+            case 'a': snprintf(cfg.mode, sizeof(cfg.mode), "%s", optarg); break;
+            case 'd': snprintf(cfg.dict_file, sizeof(cfg.dict_file), "%s", optarg); break;
+            case 'S': snprintf(cfg.separator, sizeof(cfg.separator), "%s", optarg); break;
+            case 'D': cfg.calc_digits = atol(optarg); break;
             case 'v': cfg.verbose = 1; break;
             case '1': safe_strcat(builtin, sizeof(builtin), LOWERCASE); break;
             case '2': safe_strcat(builtin, sizeof(builtin), UPPERCASE); break;
             case '3': safe_strcat(builtin, sizeof(builtin), DIGITS); break;
             case '4': safe_strcat(builtin, sizeof(builtin), SYMBOLS); break;
-            case '5': strncpy(cfg.charset, "01", sizeof(cfg.charset)-1); break;
-            case '6': strncpy(cfg.charset, "0123456789ABCDEF", sizeof(cfg.charset)-1); break;
-            case '7': strncpy(cfg.charset, "01234567", sizeof(cfg.charset)-1); break;
+            case '5': snprintf(cfg.charset, sizeof(cfg.charset), "01"); break;
+            case '6': snprintf(cfg.charset, sizeof(cfg.charset), "0123456789ABCDEF"); break;
+            case '7': snprintf(cfg.charset, sizeof(cfg.charset), "01234567"); break;
             case 'F':
-                if (strcmp(optarg, "space") == 0)
-                    cfg.format = FORMAT_SPACE;
-                else if (strcmp(optarg, "escape") == 0)
-                    cfg.format = FORMAT_ESCAPE;
-                else if (strcmp(optarg, "none") == 0)
-                    cfg.format = FORMAT_NONE;
-                else {
-                    fprintf(stderr, "Invalid format: %s (choose: none, space, escape)\n", optarg);
-                    return 1;
-                }
+                if (strcmp(optarg, "space") == 0) cfg.format = FORMAT_SPACE;
+                else if (strcmp(optarg, "escape") == 0) cfg.format = FORMAT_ESCAPE;
+                else if (strcmp(optarg, "none") == 0) cfg.format = FORMAT_NONE;
+                else { fprintf(stderr, "无效 format: %s (none|space|escape)\n", optarg); return 1; }
                 break;
             case 'A': cfg.ascii_names = 1; break;
-            case 'f': strncpy(cfg.map_file, optarg, sizeof(cfg.map_file)-1); break;
+            case 'f': snprintf(cfg.map_file, sizeof(cfg.map_file), "%s", optarg); break;
             default:
-                fprintf(stderr, "Invalid option or missing argument. Use -h for help.\n");
+                fprintf(stderr, "无效选项，用 -h 查看帮助。\n");
+                free(av);
                 return 1;
         }
     }
 
-    if (cfg.charset[0] == '\0' && builtin[0] != '\0') {
-        strncpy(cfg.charset, builtin, sizeof(cfg.charset)-1);
-    }
-    if (cfg.charset[0] == '\0') {
-        snprintf(cfg.charset, sizeof(cfg.charset), "%s%s", LOWERCASE, DIGITS);
+    /* trailing positional tokens become the expression (calc mode).
+     * NOTE: iterate over av (getopt may have permuted it), not argv. */
+    for (int i = optind; i < argc; i++) {
+        if (cfg.expr[0]) safe_strcat(cfg.expr, sizeof(cfg.expr), " ");
+        safe_strcat(cfg.expr, sizeof(cfg.expr), av[i]);
     }
 
+    if (cfg.charset[0] == '\0' && builtin[0] != '\0')
+        snprintf(cfg.charset, sizeof(cfg.charset), "%s", builtin);
+    if (cfg.charset[0] == '\0')
+        snprintf(cfg.charset, sizeof(cfg.charset), "%s%s", LOWERCASE, DIGITS);
+
+    free(av);
+    (void)opt_idx; (void)opt;
     return 0;
 }
 
-void validate_config(void) {
+static void validate_config(void)
+{
     if (cfg.min_len <= 0) cfg.min_len = 1;
     if (cfg.max_len < cfg.min_len) cfg.max_len = cfg.min_len;
     if (cfg.fixed_len > 0) cfg.min_len = cfg.max_len = cfg.fixed_len;
 
     if (strcmp(cfg.mode, "word") == 0 && cfg.dict_file[0] == '\0') {
-        fprintf(stderr, "Error: word mode requires a dictionary file (-d/--dict)\n");
-        exit(1);
+        fprintf(stderr, "错误: word 模式需要词典文件 (-d)\n"); exit(1);
     }
     if (cfg.random_mode && cfg.random_count == 0) {
-        fprintf(stderr, "Error: random mode requires a count (-R/--count)\n");
-        exit(1);
+        fprintf(stderr, "错误: 随机模式需要 -R/--count\n"); exit(1);
     }
     if (cfg.charset[0] == '\0') {
-        fprintf(stderr, "Error: character set cannot be empty\n");
-        exit(1);
+        fprintf(stderr, "错误: 字符集不能为空\n"); exit(1);
     }
 }
 
-unsigned long long estimate_total(int len, int charset_len) {
-    unsigned long long total = 1;
-    for (int i = 0; i < len; i++) {
-        if (total > ULLONG_MAX / charset_len) {
-            return ULLONG_MAX;
-        }
-        total *= charset_len;
-    }
-    return total;
-}
+/* ----------------------------------------------------------------------- */
 
-int next_password(char *pwd, int len, const char *charset) {
-    int charset_len = strlen(charset);
-    int carry = len - 1;
-    while (carry >= 0) {
-        char *pos = strchr(charset, pwd[carry]);
-        if (!pos) {
-            pwd[carry] = charset[0];
-            carry--;
-            continue;
-        }
-        int idx = pos - charset;
-        if (idx == charset_len - 1) {
-            pwd[carry] = charset[0];
-            carry--;
+int main(int argc, char *argv[])
+{
+    srand((unsigned)time(NULL));
+    if (argc > 0 && argv[0]) g_prog = argv[0];
+
+    if (argc == 1) { print_help(g_prog); return 0; }
+
+    if (argc >= 2 && strcmp(argv[1], "help") == 0) { print_help(argv[0]); return 0; }
+    if (argc >= 2 && strcmp(argv[1], "version") == 0) { print_version(); return 0; }
+
+    if (argc >= 2 && strcmp(argv[1], "calc") == 0) {
+        /* calc [options] expr [options] */
+        int es = find_expr_start(argc, argv);
+        if (es < argc && argv[es][0] == '-' && argv[es][1] != '\0') {
+            /* expression itself starts with '-', e.g. "-5": options may only
+             * appear before it (getopt would misparse "-5" as options). */
+            if (parse_calc_args(argc, argv, &es)) return 1;
+            for (int j = es; j < argc; j++) {
+                if (cfg.expr[0]) safe_strcat(cfg.expr, sizeof(cfg.expr), " ");
+                safe_strcat(cfg.expr, sizeof(cfg.expr), argv[j]);
+            }
         } else {
-            pwd[carry] = charset[idx + 1];
-            return 1;
+            if (parse_args(argc - 1, argv + 1)) return 1;
         }
+        if (cfg.expr[0] == '\0') { fprintf(stderr, "用法: %s calc [选项] \"表达式\"\n", argv[0]); return 1; }
+        return run_calc();
     }
+    if (argc >= 2 && strcmp(argv[1], "pi") == 0) {
+        /* pi [N] [options]  - print pi to N decimal places (default 50) */
+        int es = find_expr_start(argc, argv);
+        if (es < argc && argv[es][0] == '-' && argv[es][1] != '\0') {
+            if (parse_calc_args(argc, argv, &es)) return 1;
+            for (int j = es; j < argc; j++) {
+                if (cfg.expr[0]) safe_strcat(cfg.expr, sizeof(cfg.expr), " ");
+                safe_strcat(cfg.expr, sizeof(cfg.expr), argv[j]);
+            }
+        } else {
+            if (parse_args(argc - 1, argv + 1)) return 1;
+        }
+        long n = 50;
+        int explicit_digits = (cfg.calc_digits != 50);
+        if (cfg.expr[0]) {
+            char *end; long v = strtol(cfg.expr, &end, 10);
+            if (*end == '\0' && v > 0) n = v;
+        }
+        if (explicit_digits) n = cfg.calc_digits;
+        snprintf(cfg.expr, sizeof(cfg.expr), "pi");
+        /* pi has one integer digit: N decimal places => N+1 significant digits */
+        cfg.calc_digits = n + 1;
+        return run_calc();
+    }
+
+    if (parse_args(argc, argv) != 0) return 1;
+    validate_config();
+
+    if (strcmp(cfg.mode, "calc") == 0) {
+        if (cfg.expr[0] == '\0') { fprintf(stderr, "calc 模式需要表达式\n"); return 1; }
+        return run_calc();
+    }
+
+    if (cfg.verbose) {
+        printf("模式: %s\n", cfg.mode);
+        if (strcmp(cfg.mode, "password") == 0) {
+            if (cfg.fixed_len) printf("长度: %d\n", cfg.fixed_len);
+            else printf("长度范围: %d ~ %d\n", cfg.min_len, cfg.max_len);
+            printf("字符集: %s\n", cfg.charset);
+        }
+        if (cfg.prefix[0]) printf("前缀: %s\n", cfg.prefix);
+        if (cfg.suffix[0]) printf("后缀: %s\n", cfg.suffix);
+        printf("输出: %s\n", cfg.to_stdout ? "(stdout)" : cfg.output_file);
+        if (cfg.limit) printf("数量上限: %llu\n", cfg.limit);
+        printf("----------------------------------------\n");
+    }
+
+    if (strcmp(cfg.mode, "word") == 0) generate_words();
+    else if (cfg.random_mode) generate_random();
+    else generate_passwords();
+
+    if (!cfg.to_stdout)
+        printf("完成！结果已写入 %s\n", cfg.output_file);
     return 0;
-}
-
-void generate_passwords(void) {
-    FILE *fp = fopen(cfg.output_file, "w");
-    if (!fp) {
-        perror("Failed to open output file");
-        exit(1);
-    }
-
-    int charset_len = strlen(cfg.charset);
-    unsigned long long total_generated = 0;
-    int len_start = cfg.min_len;
-    int len_end = cfg.max_len;
-    char mapped[1024];
-    char formatted[1024];
-
-    for (int len = len_start; len <= len_end; len++) {
-        unsigned long long total_for_len = estimate_total(len, charset_len);
-        if (cfg.verbose) {
-            printf("Length %d: estimated %llu combinations\n", len, total_for_len);
-        }
-        if (total_for_len == ULLONG_MAX) {
-            printf("Warning: length %d overflows, cannot complete.\n", len);
-            break;
-        }
-
-        char *pwd = malloc(len + 1);
-        if (!pwd) {
-            perror("Memory allocation failed");
-            fclose(fp);
-            exit(1);
-        }
-        memset(pwd, cfg.charset[0], len);
-        pwd[len] = '\0';
-
-        unsigned long long count = 0;
-        int cont = 1;
-        while (cont) {
-            if (cfg.limit > 0 && total_generated >= cfg.limit) {
-                cont = 0;
-                break;
-            }
-            apply_mapping(pwd, mapped, sizeof(mapped));
-            format_password(mapped, formatted, sizeof(formatted), cfg.format);
-            fprintf(fp, "%s%s%s\n", cfg.prefix, formatted, cfg.suffix);
-            total_generated++;
-            count++;
-            if (count % BATCH_SIZE == 0) fflush(fp);
-
-            if (!next_password(pwd, len, cfg.charset)) {
-                cont = 0;
-            }
-        }
-        free(pwd);
-        if (cfg.limit > 0 && total_generated >= cfg.limit) break;
-    }
-
-    fclose(fp);
-}
-
-void generate_words(void) {
-    FILE *fp_dict = fopen(cfg.dict_file, "r");
-    if (!fp_dict) {
-        perror("Failed to open dictionary file");
-        exit(1);
-    }
-
-    FILE *fp_out = fopen(cfg.output_file, "w");
-    if (!fp_out) {
-        perror("Failed to open output file");
-        fclose(fp_dict);
-        exit(1);
-    }
-
-    char line[MAX_LINE];
-    unsigned long long count = 0;
-    while (fgets(line, sizeof(line), fp_dict)) {
-        if (cfg.limit > 0 && count >= cfg.limit) break;
-        line[strcspn(line, "\n")] = '\0';
-        fprintf(fp_out, "%s%s%s\n", cfg.prefix, line, cfg.suffix);
-        count++;
-        if (count % BATCH_SIZE == 0) fflush(fp_out);
-    }
-
-    fclose(fp_dict);
-    fclose(fp_out);
-}
-
-void generate_random(void) {
-    FILE *fp = fopen(cfg.output_file, "w");
-    if (!fp) {
-        perror("Failed to open output file");
-        exit(1);
-    }
-
-    int len = cfg.fixed_len ? cfg.fixed_len : (cfg.min_len + cfg.max_len) / 2;
-    if (cfg.min_len != cfg.max_len && cfg.verbose) {
-        printf("Random mode using length %d (midpoint of %d~%d)\n", len, cfg.min_len, cfg.max_len);
-    }
-
-    int charset_len = strlen(cfg.charset);
-    char *pwd = malloc(len + 1);
-    if (!pwd) {
-        perror("Memory allocation failed");
-        fclose(fp);
-        exit(1);
-    }
-    pwd[len] = '\0';
-    char mapped[1024];
-    char formatted[1024];
-
-    unsigned long long generated = 0;
-    while (generated < cfg.random_count) {
-        for (int i = 0; i < len; i++) {
-            pwd[i] = cfg.charset[rand() % charset_len];
-        }
-        apply_mapping(pwd, mapped, sizeof(mapped));
-        format_password(mapped, formatted, sizeof(formatted), cfg.format);
-        fprintf(fp, "%s%s%s\n", cfg.prefix, formatted, cfg.suffix);
-        generated++;
-        if (generated % BATCH_SIZE == 0) fflush(fp);
-    }
-
-    free(pwd);
-    fclose(fp);
 }

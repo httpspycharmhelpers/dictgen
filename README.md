@@ -1,51 +1,110 @@
 
-# dictgen – Dictionary Generator
+# dictgen – 字典生成器 + 任意精度计算器
 
-A highly customizable command-line tool for generating passwords, wordlists, binary sequences, etc.
+高性能命令行工具，用于生成密码、字典、二进制序列等，并支持任意精度的大数计算
+（GMP + MPFR）。生成走单遍流式管线，可轻松输出上亿条目；输出可直接写入普通文件、
+tar / tar.gz 打包，或打印到终端。
 
-## Build
+## 构建
 
-```
-gcc -o dictgen dictgen.c -O2 -Wall
-```
-
-Options
-
-Option Description
--h, --help Show help
---version Show version
--v, --verbose Show progress
--o FILE Output file (default: passwords.txt)
--m N Minimum length (default: 1)
--M N Maximum length (default: 8)
--l N Fixed length (overrides -m/-M)
--c STR Custom character set
---lowercase Include a-z
---uppercase Include A-Z
---digits Include 0-9
---symbols Include symbols !@#$%^&*...
---binary Use charset 01
---hex Use charset 0-9A-F
---octal Use charset 0-7
---ascii-names Map binary (01) to ASCII names (e.g. 000 → NUL)
--p STR Add prefix
--s STR Add suffix
--n N Limit number of generated items
--r Enable random mode
--R N Generate N random items (requires -r)
--a MODE Mode: password (default) or word
--d FILE Dictionary file (required for word mode)
---format FORMAT Output format: none (default), space, escape
-
-## Examples
+依赖：`gmp`、`mpfr`、`zlib`（Termux: `pkg install libgmp libmpfr zlib`）。
 
 ```
-# Generate 3-digit combinations from abc
-./dictgen -l 3 -c "abc"
-
-# Word mode with suffix
-./dictgen -a word -d words.txt -s "!"
-
-# 4-bit binary with spaces
-./dictgen --binary -l 4 --format space
+make            # 生成 ./dictgen
+make test       # 运行测试套件
 ```
+
+或手动编译：
+
+```
+gcc -O3 -o dictgen dictgen.c out.c calc.c -lgmp -lmpfr -lz -lm
+```
+
+## 用法
+
+```
+dictgen [生成选项]                    生成字典（默认写入 passwords.txt）
+dictgen calc [选项] "表达式"          计算大数表达式
+dictgen pi [N]                        输出 π 的 N 位小数（默认 50）
+```
+
+### 生成选项
+
+| 选项 | 说明 |
+| --- | --- |
+| `-h, --help` | 帮助 |
+| `--version` | 版本 |
+| `-v, --verbose` | 显示进度 |
+| `-o, --output FILE` | 输出文件；以 `.tar` / `.tar.gz` / `.tgz` 结尾则自动打包 |
+| `-t, --stdout` / `-tff` | 直接输出到终端，不写文件 |
+| `-m N` / `-M N` | 最小 / 最大长度（默认 1 / 8） |
+| `-l N` | 固定长度（覆盖 -m/-M） |
+| `-c STR` | 自定义字符集 |
+| `--lowercase` `--uppercase` `--digits` `--symbols` | 组合内置字符集（`--numbers` 为 `--digits` 别名） |
+| `--binary` `--hex` `--octal` | 使用 01 / 0-9A-F / 0-7 |
+| `--ascii-names` | 二进制映射为 ASCII 名称（`00000000` → `NUL`） |
+| `-p STR` / `-s STR` | 前缀 / 后缀 |
+| `-n, --limit N` | 数量上限 |
+| `-r, --random` / `-R, --count N` | 随机模式 / 随机项数 |
+| `-a, --mode MODE` | `password`（默认）、`word`、`calc` |
+| `-d, --dict FILE` | word 模式词典文件 |
+| `--format FORMAT` | `none`（默认）、`space`、`escape` |
+
+### 计算选项
+
+在 `calc` / `pi` 模式下：
+
+| 选项 | 说明 |
+| --- | --- |
+| `-D, --precision N` | 精度：有效数字位数（默认 50），可为 1000000；别名 `--places` |
+| `-o, --output FILE` | 结果写入文件或 tar 包（默认打印到终端） |
+| `-t, --stdout` / `-tff` | 强制打印到终端 |
+
+支持的表达式：
+
+- 运算符：`+  -  *  /  %  ^`（`^` 右结合）、后缀阶乘 `!`、一元 `-`、括号
+- 常量：`pi`、`e`
+- 函数：`sqrt(x)`、`abs(x)`、`fact(n)`、`pow(a,b)`、`digit(x,k)`（x 的小数第 k 位）
+- 隐式乘法：`2pi`、`2(3+4)`、`pi(1+1)`
+- 整数（任意长度）、小数（如 `3.14`）
+
+整数运算保持精确（GMP），涉及 `pi`/`e`/`sqrt` 或非整除除法时按给定精度用 MPFR 计算。
+`digit(x,k)` 要求 `--digits ≥ k`。
+
+## 示例
+
+```bash
+# 生成 1 亿个 8 位数字字典，直接写入 gzip 包
+./dictgen -l 8 -c "0123456789" -n 100000000 -o num.tar.gz
+
+# 直接打印到终端
+./dictgen -l 2 -c abc -t
+./dictgen -l 8 -c 0123456789 -n 100 -tff
+
+# 大数计算
+./dictgen calc "2^1000000"                 # 2 的一百万次方（30 万位）
+./dictgen calc "100000!"                   # 10 万阶乘
+./dictgen calc "2*pi*10" -D 1000000 -o two_pi.tar.gz   # 计算到 100 万位并存包
+./dictgen calc "2*pi*10" -o two_pi.tar.gz -D 1000000   # 选项可放前或后
+./dictgen calc "pi^2" -D 100               # π 的平方
+./dictgen calc "digit(2*pi,32)"            # 2π 的第 32 位小数
+./dictgen pi 1000000                       # π 的一百万位小数
+
+# 其他
+./dictgen -a word -d words.txt -s "!"      # 词典加后缀
+./dictgen --binary -l 4 --format space     # 4 位二进制，空格分隔
+```
+
+## 性能
+
+单机（Termux, aarch64）实测：
+
+| 任务 | 耗时 |
+| --- | --- |
+| 生成 1000 万个 8 位数字 | ~0.7 s |
+| 生成 1 亿个 8 位数字 | ~6 s |
+| `2^1000000`（30 万位整数） | < 0.1 s |
+| `100000!`（45 万位整数） | < 0.1 s |
+| π 到 100 万位 | ~3 s |
+
+生成器使用大块缓冲输出与索引式 odometer，避免逐字符查找与频繁 flush。
