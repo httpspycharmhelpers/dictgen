@@ -285,22 +285,26 @@ static void generate_passwords(void)
     Out *o = out_open(cfg.output_file, cfg.to_stdout);
     if (!o) { fprintf(stderr, "无法打开输出: %s: %s\n", cfg.output_file, strerror(errno)); exit(1); }
 
-    int cslen = (int)strlen(cfg.charset);
+    const char *cs = cfg.charset;
+    int cslen = (int)strlen(cs);
+    char z = cs[0];
+    int fast = (cfg.format == FORMAT_NONE && !cfg.prefix[0] && !cfg.suffix[0] &&
+                !cfg.ascii_names);
+    unsigned long long limit = cfg.limit;
+    int has_limit = limit != 0;
     unsigned long long total = 0;
+
     /* one item can expand to 4 bytes/char (escape) plus prefix/suffix/newline */
     size_t itemmax = (size_t)cfg.max_len * 4 + strlen(cfg.prefix) + strlen(cfg.suffix) + 16;
     size_t bufsz = OUT_BLOCK + itemmax;
     char *buf = malloc(bufsz);
-    char *pwd = NULL;
-    int *idx = NULL;
     if (!buf) { perror("malloc"); exit(1); }
 
     for (int len = cfg.min_len; len <= cfg.max_len && !out_error(o); len++) {
-        free(pwd); free(idx);
-        pwd = malloc((size_t)len + 1);
-        idx = malloc((size_t)len * sizeof(int));
+        char *pwd = malloc((size_t)len + 1);
+        int *idx = malloc((size_t)len * sizeof(int));
         if (!pwd || !idx) { perror("malloc"); exit(1); }
-        for (int i = 0; i < len; i++) { idx[i] = 0; pwd[i] = cfg.charset[0]; }
+        for (int i = 0; i < len; i++) { idx[i] = 0; pwd[i] = z; }
         pwd[len] = '\0';
 
         if (cfg.verbose) printf("长度 %d: 开始生成\n", len);
@@ -308,24 +312,31 @@ static void generate_passwords(void)
         size_t blen = 0;
         int done = 0;
         while (!done) {
-            if (cfg.limit && total >= cfg.limit) break;
-            emit(buf, &blen, pwd, len);
+            if (fast) {
+                memcpy(buf + blen, pwd, (size_t)len);
+                blen += (size_t)len;
+                buf[blen++] = '\n';
+            } else {
+                emit(buf, &blen, pwd, len);
+            }
             total++;
             if (blen >= OUT_BLOCK) {
                 out_write(o, buf, blen);
                 blen = 0;
             }
+            if (has_limit && total >= limit) break;
             /* odometer increment (rightmost position) */
             int i = len - 1;
-            while (i >= 0 && idx[i] == cslen - 1) { idx[i] = 0; pwd[i] = cfg.charset[0]; i--; }
+            while (i >= 0 && idx[i] == cslen - 1) { idx[i] = 0; pwd[i] = z; i--; }
             if (i < 0) done = 1;
-            else { idx[i]++; pwd[i] = cfg.charset[idx[i]]; }
+            else { pwd[i] = cs[++idx[i]]; }
         }
         if (blen) { out_write(o, buf, blen); blen = 0; }
-        if (cfg.limit && total >= cfg.limit) break;
+        free(pwd); free(idx);
+        if (has_limit && total >= limit) break;
     }
 
-    free(buf); free(pwd); free(idx);
+    free(buf);
     if (cfg.verbose) printf("共生成 %llu 项\n", total);
     out_close(o);
 }
