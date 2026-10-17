@@ -392,8 +392,22 @@ static void generate_words(void)
 /* calc mode                                                               */
 /* ----------------------------------------------------------------------- */
 
+/* Safety: refuse absurd precisions that would exhaust memory/CPU.  A request
+ * like --digits 100000000 would need GB of RAM and hours of CPU. */
+#define MAX_CALC_DIGITS 50000000L
+
 static int run_calc(void)
 {
+    if (cfg.calc_digits > MAX_CALC_DIGITS) {
+        double mb = (double)cfg.calc_digits * 3.3219280948873626 / 8.0 / 1048576.0;
+        fprintf(stderr,
+            "拒绝: --digits %ld 超过上限 %ld。\n"
+            "  单个高精度数即约需 %.0f MB，加上中间结果通常要求数百 MB 内存，\n"
+            "  且计算可能耗时数小时，会耗尽内存/电池。\n"
+            "  建议: 先用较小值 (如 1000000) 试算，确认无误后再逐步提高。\n",
+            cfg.calc_digits, MAX_CALC_DIGITS, mb);
+        return 1;
+    }
     const char *err = NULL;
     char *res = calc_run(cfg.expr, cfg.calc_digits, &err);
     if (!res) {
