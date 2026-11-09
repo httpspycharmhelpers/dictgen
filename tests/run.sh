@@ -68,6 +68,10 @@ echo "== big outputs (digit counts) =="
 expect "2^1000000 digits"   "301030" "$(calc '2^1000000' | tr -d '\n' | wc -c | tr -d ' ')"
 expect "100000! digits"     "456574" "$(calc '100000!' | tr -d '\n' | wc -c | tr -d ' ')"
 
+echo "== precision =="
+expect "no digit cap" "5" "$($BIN calc --digits 50000001 '2+3')"
+expect "no digit cap (100M)" "5" "$($BIN calc --digits 100000001 '2+3')"
+
 echo "== pi subcommand =="
 expect "pi 20 decimals" \
   "3.14159265358979323846" "$($BIN pi 20)"

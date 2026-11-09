@@ -68,7 +68,11 @@ static void chud_bs(mpz_t P, mpz_t Q, mpz_t T, long a, long b)
         mpz_mul_si(p, p, (long)(6*a - 1));
         mpz_set(P, p);
         mpz_set_ui(Q, 1);
-        mpz_mul_ui(Q, Q, (unsigned long)a * (unsigned long)a * (unsigned long)a);
+        /* 必须分三次乘：a^3 在 a > 2.6e6（约 4000 万位）后超出 64 位，
+         * 先算 a*a*a 会静默溢出，导致高精度 π 错误。 */
+        mpz_mul_ui(Q, Q, (unsigned long)a);
+        mpz_mul_ui(Q, Q, (unsigned long)a);
+        mpz_mul_ui(Q, Q, (unsigned long)a);
         mpz_mul_ui(Q, Q, CHUD_C3_24);
         mpz_mul_ui(T, P, CHUD_A + CHUD_B * (unsigned long)a);
         if (a & 1) mpz_neg(T, T);
